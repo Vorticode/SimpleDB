@@ -1,7 +1,12 @@
 <?php
 
 /**
- * SimpleDB is a thin wrapper around PHP's PDO, to automate away creating connections, preparing statements,
+ * SimpleDB
+ * https://github.com/Vorticode/SimpleDB
+ * @author Eric Poggel
+ * @license MIT
+ *
+ * SimpleDB is a thin wrapper around PHP's PDO library, to automate away creating connections, preparing statements,
  * iterating over results, converting types, and setting up transactions.
  * It's a one-database-at-a-time class, a deliberate choice to keep it
  * simple enough to be implemented as a set of static functions.
@@ -38,9 +43,6 @@
  *
  * // Update existing row when primary key(s) are set:
  * SimpleDB::save('users', ['id'=>3, 'name'=>'Fred', 'email'=>'fred@fred.com']);
- *
- * @author Eric Poggel
- * @license MIT
  *
  *
  * TODO:

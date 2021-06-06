@@ -1,6 +1,6 @@
 # SimpleDB
 
-A lightweight wrapper around PDO to make PHP database access even simpler.  Supports MySQL, MariaDB, and SQLite.  Other databases might be supported in time.  Requires PHP 7.4 and the PDO extensions for MySQL or SQLite.
+SimpleDB is a thin wrapper around PHP's PDO library, to automate away creating connections, preparing statements, iterating over results, converting types, and setting up transactions.  Supports MySQL, MariaDB, and SQLite.  Other databases might be supported in time.  Requires PHP 7.4 and the PDO extensions for MySQL or SQLite.
 
 SimpleDB is currently beta software.
 
@@ -27,6 +27,8 @@ $GLOBALS['SimpleDB'] = [
     ]
 ];
 ```
+
+Specifying the config options via `$GLOBALS` allows them to be set in a configuration file without importing SimpleDB.  That way a PHP class autoloader can only import SimpleDB if it's used, reducing PHP execution time.
 
 ## Query
 
