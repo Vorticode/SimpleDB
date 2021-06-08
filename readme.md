@@ -131,13 +131,11 @@ The functions `insert`, `update`, or `save()` can accept either arrays or object
     1. null for nullable columns
     2. 0 for int and float columns
     3. false for boolean columns
-    4. The current DateTime for DateTime columns
 2. Inserting updating null into non-nullable columns will become:
     1. The default value if the column has a default.
     2. Empty string for text columns.
     3. 0 for int and float columns.
     4. false for boolean columns
-    5. The current DateTime for DateTime columns
 3. Inserting a number into a DateTime column will interpret it as the current Unix timestamp.
 4. Inserting a string into a DateTime column will parse it as a date according to the rules of `strtotime()`.
 

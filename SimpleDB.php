@@ -69,6 +69,7 @@ class SimpleDB {
 
 	/** @type PDO */
 	static $connection = null;
+	static $dateTimeClass = 'SimpleDBDateTime'; // Allows good json serialization of Dates
 
 	protected static $driver = null; // Will be 'mysql' or 'sqlite'
 	protected static $tables = [];    // Table descriptions, populated as they are queried.
@@ -210,9 +211,9 @@ class SimpleDB {
 				throw new SimpleDBException("Table \"$table\" doen't exist.");
 
 			$types = array ( // Convert MySQL types to a simpler enum of types
-				SimpleDBColType::INT  => 'INT|INTEGER|TINYINT|SMALLINT|MEDIUMINT|BIGINT|UNSIGNED BIG INT|INT2|INT8|BOOLEAN|DATE|DATETIME',
+				SimpleDBColType::INT  => 'INT|INTEGER|TINYINT|SMALLINT|MEDIUMINT|BIGINT|UNSIGNED BIG INT|INT2|INT8|BOOLEAN',
 				SimpleDBColType::FLOAT  => 'REAL|DOUBLE|DOUBLE PRECISION|FLOAT|NUMERIC|DECIMAL.*',
-				//ColType::DATE    => 'DATE|DATETIME',
+				SimpleDBColType::DATE    => 'DATE|DATETIME',
 				SimpleDBColType::TEXT    => '.' // everything else, including blobs
 			);
 
@@ -265,9 +266,9 @@ class SimpleDB {
 
 			$types = array ( // Convert MySQL types to a simpler enum of types
 				SimpleDBColType::BOOL 	 => 'tinyint\(1\)|bool|boolean|bit|int1',
-				SimpleDBColType::INT    =>  'tinyint|smallint|mediumint|int[\((0-9)+\)]?|bigint|int4|int8|middleint|timestamp|year',
+				SimpleDBColType::INT    =>  'tinyint|smallint|mediumint|int[\((0-9)+\)]?|bigint|int4|int8|middleint|year',
 				SimpleDBColType::FLOAT  =>  'float[\((0-9)+\)]?|double[\((0-9)+\)]?|decimal[\((0-9)+\)]?|numeric[\((0-9)+\)]?',
-				SimpleDBColType::DATE    => 'datetime|date|time',
+				SimpleDBColType::DATE    => 'datetime|date|time|timestamp',
 				SimpleDBColType::ENUM    => 'enum\([^\)]*\)',
 				SimpleDBColType::TEXT    => '.' // everything else, including blobs
 			);
@@ -327,18 +328,8 @@ class SimpleDB {
 		// The code below is inlined for performance, but is equivalent to:
 		// return static::getCursor($sql, $params, $Type)->toArray();
 		$statement = static::internalExecute($sql, $params);
-		if (is_array($Type))
-			$statement->setFetchMode(PDO::FETCH_ASSOC);
-		elseif ($Type)
-			$statement->setFetchMode(PDO::FETCH_CLASS | PDO::FETCH_PROPS_LATE, $Type);
-		else
-			$statement->setFetchMode(PDO::FETCH_OBJ);
-		$result = [];
-		while ($row = $statement->fetch())
-			$result[] = $row;
-
-		$statement->closeCursor();
-		return $result;
+		$resultSet = new SimpleDBResultSet($statement, $sql, $Type);
+		return $resultSet->toArray();
 	}
 
 	/**
@@ -352,15 +343,8 @@ class SimpleDB {
 		// The code below is inlined for performance, but is roughly equivalent to:
 		// return static::getCursor($sql, $params, $Type)->toArray()[0];
 		$statement = static::internalExecute($sql, $params);
-
-		if (is_array($Type))
-			$statement->setFetchMode(PDO::FETCH_ASSOC);
-		elseif ($Type)
-			$statement->setFetchMode(PDO::FETCH_CLASS | PDO::FETCH_PROPS_LATE, $Type);
-		else
-			$statement->setFetchMode(PDO::FETCH_OBJ);
-
-		if ($row = $statement->fetch()) {
+		$resultSet = new SimpleDBResultSet($statement, $sql, $Type);
+		foreach ($resultSet as $row) {
 			$statement->closeCursor();
 			return $row;
 		}
@@ -375,10 +359,12 @@ class SimpleDB {
 	 * @throws SimpleDBException */
 	static function getOne(string $sql, $params=null) {
 		$statement = static::internalExecute($sql, $params);
-		if ($row = $statement->fetch()) {
+		$resultSet = new SimpleDBResultSet($statement, $sql);
+		foreach ($resultSet as $row) {
 			$statement->closeCursor();
 			return reset($row);
 		}
+
 		return null;
 	}
 
@@ -567,13 +553,15 @@ class SimpleDB {
 		try {
 			$ids = [];
 			$file = fopen($csvFilePath, 'r');
-			static::transaction(function() use ($file, $tableName, $hasHeaders, $transform, &$ids) {
+			$i = 1;
+			static::transaction(function() use ($file, $tableName, $hasHeaders, $transform, &$ids, &$i) {
 
 				// Figure out headers.
 				$headers = $hasHeaders ? fgetcsv($file) : null;
 				$desc = static::describe($tableName);
 
 				while ($line = fgetcsv($file)) {
+					$i++;
 
 					$row = [];
 					$csvRow = $hasHeaders ? array_combine($headers, $line) : $line;
@@ -612,7 +600,10 @@ class SimpleDB {
 
 					// Insert into DB
 					$ids []= static::insert($tableName, $row);
+
 				}
+			}, function($exception) use (&$i) {
+				throw new Exception("Error on line $i.");
 			});
 			return $ids;
 		}
@@ -733,7 +724,7 @@ class SimpleDB {
 	 * Execute all of the code within $func as a single transaction, committing on success or
 	 * rolling back if an exception is thrown.
 	 * @param callable $func
-	 * @param ?callable $error
+	 * @param ?callable $error function(Exception $e)
 	 * @return mixed The result of $func, or null on failure.
 	 * @throws SimpleDBException|Throwable */
 	static function transaction(callable $func, ?callable $error=null) {
@@ -876,8 +867,6 @@ class SimpleDB {
 				return 0;
 			if ($col->type==SimpleDBColType::BOOL)
 				return false;
-			if ($col->type==SimpleDBColType::DATE)
-				return new DateTime(); // current date/time
 		}
 
 		// Coerce null to a different "empty" value for non-nullable fields.
@@ -896,10 +885,10 @@ class SimpleDB {
 		if ($col->type == SimpleDBColType::DATE) {
 			if (is_int($value) || is_float($value)) {
 				$unixTime = number_format($value, 3, '.', '');
-				return DateTime::createFromFormat('U.u', $unixTime);
+				return static::$dateTimeClass::createFromFormat('U.u', $unixTime);
 			}
 			if (is_string($value))
-				return new DateTime($value);
+				return new static::$dateTimeClass($value);
 		}
 
 		// No coercion necessary
@@ -1007,6 +996,17 @@ class SimpleDB {
 
 class SimpleDBException extends Exception {}
 
+/**
+ * Allow formatting PHP DateTimes as a string when json encoding, not an object.
+ * https://stackoverflow.com/a/42190930 */
+class SimpleDBDateTime extends DateTime implements JsonSerializable {
+	public function jsonSerialize() {
+		return $this->format('u') !== '000000'
+			? $this->format('Y-m-d H:i:s.u')
+			: $this->format('Y-m-d H:i:s');
+	}
+}
+
 class SimpleDBColumn {
 	public $name;
 	public $type = SimpleDBColType::TEXT;
@@ -1056,12 +1056,20 @@ class SimpleDBResultSet implements Iterator {
 		$this->sql = $sql;
 		$this->Type = $Type;
 
+		// http://gcov.php.net/PHP_7_3/lcov_html/ext/pdo_mysql/mysql_statement.c.gcov.php
 		$typeMap = [
 			'BIT' => SimpleDBColType::BOOL,
 			'TINY' => SimpleDBColType::INT,
+			'SHORT' => SimpleDBColType::INT,
+			'INT24' => SimpleDBColType::INT,
 			'LONG' => SimpleDBColType::INT,
+			'LONGLONG' => SimpleDBColType::INT,
 			'DOUBLE' => SimpleDBColType::FLOAT,
-			'DATETIME' => SimpleDBColType::DATE
+			'DECIMAL' => SimpleDBColType::FLOAT,
+			'NEWDECIMAL' => SimpleDBColType::FLOAT,
+			'DATE' => SimpleDBColType::DATE,
+			'DATETIME' => SimpleDBColType::DATE,
+			'TIMESTAMP' => SimpleDBColType::DATE
 		];
 
 		$len = $statement->columnCount();
@@ -1131,7 +1139,7 @@ class SimpleDBResultSet implements Iterator {
 				if ($this->types[$name] === SimpleDBColType::FLOAT)
 					$value = floatval($value);
 				if ($this->types[$name] === SimpleDBColType::DATE)
-					$value = new DateTime($value);
+					$value = new SimpleDB::$dateTimeClass($value);
 			}
 		}
 	}
