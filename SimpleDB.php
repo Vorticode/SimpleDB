@@ -13,25 +13,33 @@
  * It supports MySQL, MariaDB, and SQLite.
  *
  * @example
+ *
+ * // Connect to SQLite:
+ * $GLOBALS['SimpleDB'] = 'sqlite:path/to/db.sqlite3';
+ *
  * // Connect to MySQL or MariaDB
  * $GLOBALS['SimpleDB'] = [
  *    'url'=>'mysql:host=localhost;dbname=test;charset=utf8mb4',
  *    'user'=>'root',
  *    'password'=> 'sql',
  *    'options'=> [ // Optional options array to pass to PDO:
- *        PDO::ATTR_PERSISTENT => false,
- *        PDO::MYSQL_ATTR_FOUND_ROWS => true
+ *        PDO::ATTR_PERSISTENT =>  true,
+ *        PDO::MYSQL_ATTR_FOUND_ROWS => true,
+ *        PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => false
  *    ]
  * ];
  *
- * // Connect to SQLite:
- * $GLOBALS['SimpleDB'] = 'sqlite:path/to/db.sqlite3';
- *
  * // Get multiple rows, passing an argument:
- * // Database connection doesn't occur until this line.
  * $rows = SimpleDB::getRows("SELECT name, email FROM users WHERE type=?", ['noob']);
  * foreach ($rows as $row)
  *     print "Hello $row->name!  Your email is $row->email!";
+ *
+ * // Get multiple rows, buffered so we don't use too much memory for a large result set.
+ * // For buffering to work, make sure that  PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => false is passed to MySQL when connecting.
+ * $rows = SimpleDB::getCursor("SELECT name, email FROM users WHERE type=?", ['noob']);
+ * foreach ($rows as $row)
+ *     print "Hello $row->name!  Your email is $row->email!";
+ * SimpleDB::statementReturn($rows); // Free the cursor.
  *
  * // Run arbitrary queries:
  * SimpleDB::execute("DELETE FROM users");
@@ -46,11 +54,9 @@
  *
  *
  * TODO:
+ * Cannot getRows() from a table with a Fetch Class with a field of type DateTime.  "annot assign string to property ... $created of type DateTime"
  * Write tests!
  *
- * I can use $stm->getColumnMeta() instead of $description for type conversions?
- *     MYSQLI_OPT_INT_AND_FLOAT_NATIVE or something similar for PDO to get int and float back for query result columns, instead of strings.
- *     This would prevent needing to call describe() just to return query results.
  * createList() and converting values for WHERE a in (b,c,d) queries?
  * Extend PDOStatement here to access executionTime and returned rows?
  *     https://www.php.net/manual/en/class.pdostatement.php
@@ -153,8 +159,14 @@ class SimpleDB {
 				$type = '?' . $type;
 
 			$fieldCode = "\tpublic $type \$$col->name";
-			if (($col->isNull || isset($col->default)) && $col->default !== 'current_timestamp()')
-				$fieldCode .= '=' . json_encode($col->default);
+			if (($col->isNull || isset($col->default)) && $col->default !== 'current_timestamp()' && $col->default !== 'curdate()') {
+				if ($col->default === null)
+					$fieldCode .= '=null';
+				elseif (in_array($col->type, ['Date', 'Enum', 'Text']))
+					$fieldCode .= '=' . json_encode(trim($col->default, "'"));
+				else
+					$fieldCode .= '=' . $col->default;
+			}
 			$fieldCode .= ";";
 			$fields []= $fieldCode;
 		}
@@ -189,7 +201,7 @@ class SimpleDB {
 	 * @param string|null $table Test
 	 * @param bool $force
 	 * @return SimpleDBColumn[] Key is lower case version of the column name.
-	 * @throws SimpleDBException|PDOException */
+	 * @throws SimpleDBException */
 	static function describe(string $table=null, bool $force=false): array {
 		static::connect();
 
@@ -211,9 +223,10 @@ class SimpleDB {
 				throw new SimpleDBException("Table \"$table\" doen't exist.");
 
 			$types = array ( // Convert MySQL types to a simpler enum of types
-				SimpleDBColType::INT  => 'INT|INTEGER|TINYINT|SMALLINT|MEDIUMINT|BIGINT|UNSIGNED BIG INT|INT2|INT8|BOOLEAN',
-				SimpleDBColType::FLOAT  => 'REAL|DOUBLE|DOUBLE PRECISION|FLOAT|NUMERIC|DECIMAL.*',
-				SimpleDBColType::DATE    => 'DATE|DATETIME',
+				SimpleDBColType::INT     => 'INT|INTEGER|TINYINT|SMALLINT|MEDIUMINT|BIGINT|UNSIGNED BIG INT|INT2|INT8|BOOLEAN',
+				SimpleDBColType::FLOAT   => 'REAL|DOUBLE|DOUBLE PRECISION|FLOAT|NUMERIC|DECIMAL.*',
+				SimpleDBColType::DATE    => 'DATE',
+				SimpleDBColType::DATETIME=> 'DATETIME',
 				SimpleDBColType::TEXT    => '.' // everything else, including blobs
 			);
 
@@ -232,6 +245,7 @@ class SimpleDB {
 					else {
 
 						// Make sure sqllite_sequenec table exists.  If it doesn't then the database has no auto-inc columns in any tables.
+						/** @noinspection SqlResolve */
 						$stm1 = static::$connection->prepare(
 							"SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'");
 						$stm1->execute();
@@ -266,9 +280,10 @@ class SimpleDB {
 
 			$types = array ( // Convert MySQL types to a simpler enum of types
 				SimpleDBColType::BOOL 	 => 'tinyint\(1\)|bool|boolean|bit|int1',
-				SimpleDBColType::INT    =>  'tinyint|smallint|mediumint|int[\((0-9)+\)]?|bigint|int4|int8|middleint|year',
-				SimpleDBColType::FLOAT  =>  'float[\((0-9)+\)]?|double[\((0-9)+\)]?|decimal[\((0-9)+\)]?|numeric[\((0-9)+\)]?',
-				SimpleDBColType::DATE    => 'datetime|date|time|timestamp',
+				SimpleDBColType::INT     =>  'tinyint|smallint|mediumint|int[\((0-9)+\)]?|bigint|int4|int8|middleint|year',
+				SimpleDBColType::FLOAT   =>  'float[\((0-9)+\)]?|double[\((0-9)+\)]?|decimal[\((0-9)+\)]?|numeric[\((0-9)+\)]?',
+				SimpleDBColType::DATE    => 'date',
+				SimpleDBColType::DATETIME=> 'datetime|timestamp', // "time" becomes string.
 				SimpleDBColType::ENUM    => 'enum\([^\)]*\)',
 				SimpleDBColType::TEXT    => '.' // everything else, including blobs
 			);
@@ -339,17 +354,15 @@ class SimpleDB {
 	 * @return mixed|null
 	 * @throws SimpleDBException */
 	static function getRow(string $sql, $params=null, $Type=null) {
-
-		// The code below is inlined for performance, but is roughly equivalent to:
-		// return static::getCursor($sql, $params, $Type)->toArray()[0];
 		$statement = static::internalExecute($sql, $params);
 		$resultSet = new SimpleDBResultSet($statement, $sql, $Type);
+		$result = null;
 		foreach ($resultSet as $row) {
-			$statement->closeCursor();
-			return $row;
+			$result = $row;
+			break;
 		}
-
-		return null;
+		$statement->closeCursor();
+		return $result;
 	}
 
 	/**
@@ -360,12 +373,13 @@ class SimpleDB {
 	static function getOne(string $sql, $params=null) {
 		$statement = static::internalExecute($sql, $params);
 		$resultSet = new SimpleDBResultSet($statement, $sql);
+		$result = null;
 		foreach ($resultSet as $row) {
-			$statement->closeCursor();
-			return reset($row);
+			$result = reset($row);
+			break;
 		}
-
-		return null;
+		$statement->closeCursor();
+		return $result;
 	}
 
 
@@ -373,9 +387,10 @@ class SimpleDB {
 	static function getColumn(string $sql, $params=null): array {
 		// TOOD:  Use PDO::FETCH_COLUMN ?
 		$result = [];
-		$rows = static::getCursor($sql, $params)->toArray();
+		$rows = static::getCursor($sql, $params);
 		foreach ($rows as $row)
 			$result[]= reset($row); // gets first item.
+		static::statementReturn($rows);
 
 		return $result;
 	}
@@ -383,7 +398,9 @@ class SimpleDB {
 
 	/**
 	 * Similar to getRows() except it returns a cursor to stream/iterate over the rows.
-	 * If you want the returned
+	 * Be sure to return the cursor when done!
+	 * Use SimpleDB::statementReturn(SimpleDBResultSet $resultSet);
+	 *
 	 * @param string $sql
 	 * @param array|string $params An array of parameters, or a single value if only one parameter is needed.
 	 * @param string|array= $Type Class name or an empty array().  Each result row will be cast to this type.
@@ -453,6 +470,13 @@ class SimpleDB {
 		if ($params)
 			$sql .= ' WHERE ' . static::buildWhere($params);
 
+		// Coerce params to proper type.
+		// This will, for example, convert '01-Jan-21' to a DateTime object.
+		$desc = static::describe($table);
+		foreach ($params as $name=>$value)
+			$params[$name] = static::coerce($params[$name], $desc[strtolower($name)]);
+
+
 		if ($limit !== null && $start !== 0)
 			$sql .= " LIMIT $start, $limit ";
 		else if ($limit !== null)
@@ -464,6 +488,7 @@ class SimpleDB {
 		return static::getCursor($sql, $params, $Type);
 	}
 
+
 	/**
 	 * Find the first row that matches the $params associative array.
 	 * @param string $table
@@ -472,26 +497,33 @@ class SimpleDB {
 	 * @throws Exception
 	 * @return $Type|stdclass|array */
 	static function findRow(string $table, $params=null, $Type=null) {
+
+
 		if ($params !== null && !is_array($params)) {
 
 			// Build an array of primary key columns.
-			$primaries = [];
-			$description = static::describe($table);
-			foreach($description as $col)
-				if ($col->isPrimary)
-					$primaries[]=$col->name;
+			$primaries = static::getPrimaryKeys($table);
 
 			// If there's exactly 1, we can default to using it.
 			if (count($primaries) === 1)
 				$params = array($primaries[0]=>$params);
 			else
-				throw new SimpleDBException("findFirst() \$params cannot be a primitive value because $table does not have exactly one primary key.");
+				throw new SimpleDBException("findRow() \$params cannot be a primitive value because $table doesn't have exactly one primary key.");
 		}
 
-		$rows = static::find($table, $params, $Type, 0, 1);
+		$rows = static::findCursor($table, $params, $Type, 0, 1); // TODO: This checks out but never returns the cursor.
 		foreach ($rows as $item)
 			return $item;
 		return null;
+	}
+
+	static function getPrimaryKeys($table): array {
+		$primaries = [];
+		$description = static::describe($table);
+		foreach($description as $col)
+			if ($col->isPrimary)
+				$primaries[]=$col->name;
+		return $primaries;
 	}
 
 	/**
@@ -499,29 +531,17 @@ class SimpleDB {
 	 * @param string $table
 	 * @param array|object $row
 	 * @throws SimpleDBException */
-	static function findRowByPrimaries(string $table, $row): ?object {
-		$description = static::describe($table);
-		// If the primary keys are not set, return null
-		foreach ($description as $col)
-			if (is_array($row) && $col->isPrimary && (!isset($row[$col->name]) || $row[$col->name]===null))
-				return null;
-
-			elseif (is_object($row) && $col->isPrimary && (!isset($row->{$col->name}) || $row->{$col->name}===null))
-				return null;
-
-
-		// Otherwise, check for an existing row.
-		$primaries = [];
-		foreach ($row as $name=>$value) {
-			$lowerName = strtolower($name);
-			if (isset($description[$lowerName]) && $description[$lowerName]->isPrimary) {
-				$colName = $description[$lowerName]->name;
-				$val = is_array($row) ? $row[$colName] : $row->{$colName};
-				$primaries[$colName] = $val;
-			}
+	static function findRowByPrimaries(string $table, $row, $Type=null) {
+		$params = [];
+		foreach (static::getPrimaryKeys($table) as $colName) {
+			$val = is_array($row) ? $row[$colName] ?? null : $row->{$colName} ?? null;
+			if ($val === null)
+				return null; // If the primary keys are not set, return null
+			$params[$colName] = $val;
 		}
 
-		return static::findRow($table, $primaries);
+		$sql = "SELECT * FROM $table WHERE " . static::buildWhere($params) . " LIMIT 1";
+		return static::getRow($sql, $params, $Type);
 	}
 
 	/**
@@ -530,17 +550,18 @@ class SimpleDB {
 	 *
 	 * @param string $tableName
 	 * @param string $csvFilePath
-	 * @param bool $hasHeaders True if the first line of the csv file is headers.
-	 * @param ?array $headersMap Key is the name of the table's column, the value is an array of other names it might go by.
-	 *     Or if $hasHeaders=false, it's an array where the values are the headers.
-	 *
 	 * @param ?array $transform Key is the name of the tables column, value can be:
 	 *     1. A function(string[] $row):string that will transform it to the proper value before inserting.
 	 *     2. A string csv column name or number from which to get the value.
 	 *     3. A string[] of csv column names or numbers for where to look for the value.
-	 * @return array An array of ids created when inserting into auto-increment columns.
+	 * @param bool $hasHeaders True if the first line of the csv file is headers.
+	 * @param array $replaceKeys When inserting a row, if another row exists where a key has the same value as the new row, replace it.
+	 * @param callable $rowsProcessed Call this function after every row is processed, along with any exception that occurred during processing.
+	 *     If this function returns false, the import will stop.
+	 *
+	 * @return array|false An array of ids created when inserting into auto-increment columns.
+	 *
 	 * @throws SimpleDBException
-	 * @throws Throwable
 	 *
 	 * @example
 	 * SimpleDB::importCsv('stocks', 'stocks.csv', [
@@ -549,21 +570,22 @@ class SimpleDB {
 	 *     'shares'=>1,
 	 *     'beta'=>['beta2', 'Beta', 'B']
 	 * ]); */
-	static function importCsv(string $tableName, string $csvFilePath, ?array $transform=[], $hasHeaders=true): array {
+	static function importCsv(string $tableName, string $csvFilePath, ?array $transform=[], $hasHeaders=true, $replaceKeys=null, ?callable $rowsProcessed=null) {
 		try {
+
 			$ids = [];
 			$file = fopen($csvFilePath, 'r');
 			$i = 1;
-			static::transaction(function() use ($file, $tableName, $hasHeaders, $transform, &$ids, &$i) {
 
-				// Figure out headers.
-				$headers = $hasHeaders ? fgetcsv($file) : null;
-				$desc = static::describe($tableName);
+			// Figure out headers.
+			$headers = $hasHeaders ? fgetcsv($file) : null;
+			$desc = static::describe($tableName);
 
-				while ($line = fgetcsv($file)) {
-					$i++;
+			while ($line = fgetcsv($file)) {
+				$i++;
+				$row = [];
+				try {
 
-					$row = [];
 					$csvRow = $hasHeaders ? array_combine($headers, $line) : $line;
 					foreach ($desc as $meta) {
 						$dbCol = $meta->name;
@@ -571,8 +593,8 @@ class SimpleDB {
 						// Transform columns
 						if (isset($transform[$dbCol])) {
 
-							// Function
-							if (is_callable($transform[$dbCol]))
+							// Function (and not just the string name of a function)
+							if (is_callable($transform[$dbCol]) && !is_string($transform[$dbCol]))
 								$row[$dbCol] = $transform[$dbCol]($csvRow);
 
 							// Array of csv column names to search.
@@ -599,12 +621,31 @@ class SimpleDB {
 					}
 
 					// Insert into DB
-					$ids []= static::insert($tableName, $row);
+					if ($replaceKeys) {
+						$where = [];
+						foreach ($replaceKeys as $name)
+							$where[$name] = $row[$name];
+						$existing = static::findRow($tableName, $where);
 
+						if ($existing) // TODO: Use description to get primary key name, instead of assuming "id".
+							/** @noinspection SqlResolve */
+							static::execute("DELETE FROM $tableName WHERE id=?", $existing->id);
+					}
+
+					// TODO: use insertMulti?
+					$ids [] = static::insert($tableName, $row);
+					if ($rowsProcessed) {
+						$status = $rowsProcessed($i, $row);
+						if ($status === false)
+							return false;
+					}
+				} catch (Throwable $ex) {
+					$status = $rowsProcessed($i, $row, $ex);
+					if ($status === false)
+						return false;
 				}
-			}, function($exception) use (&$i) {
-				throw new Exception("Error on line $i.");
-			});
+
+			}
 			return $ids;
 		}
 		finally {
@@ -672,22 +713,88 @@ class SimpleDB {
 	}
 
 	/**
+	 * Insert multiple rows at a time, which is usually faster.
+	 * Skips type coercion for better performance.
+	 * TODO: Figure out how to get the ids of the newly inserted rows?
+	 * @param string $tableName
+	 * @param array $rows */
+	static function insertMulti(string $tableName, array $rows) {
+		if (!count($rows))
+			return;
+
+		$names = [];
+		$description = static::describe($tableName);
+		if (!$description)
+			throw new SimpleDBException("Table '$tableName' doesn't exist.");
+
+
+
+		$q = static::getDriver() === 'mysql' ? '`' : "'";
+
+		$row = $rows[0];
+		foreach ($description as $lName=>$col) {
+			$name = $col->name;
+
+			// Only specify a value where $row has a value,
+			// or if the column is non-null with no default and no auto-increment, we add a value to prevent an insert error.
+			$exists = is_object($row) ? isset($row->$name) : isset($row[$name]);
+			if ($exists)
+				$names[]= $name;
+		}
+		$namesCsv = $q . implode("$q,$q", $names) . $q;
+
+		$params = [];
+		$values = [];
+		$valueSet = '(' . str_repeat('?,', count($names)-1) . '?)';
+		$sql = "INSERT INTO $tableName ($namesCsv) VALUES ";
+		foreach ($rows as $row) {
+
+			$values []= $valueSet;
+
+			if (is_object($row))
+				foreach ($names as $name)
+					$params[] = $row->$name;
+			else
+				foreach ($names as $name)
+					$params[]= $row[$name];
+		}
+
+		$sql .= implode(',', $values);
+
+		// Benchmarking shows almost all of this functions time occurs within the query, even when inserting 1000 rows.
+		$statement = static::internalExecute($sql, $params);
+		$statement->closeCursor();
+	}
+
+	/**
 	 * Insert a new object as a row, or update an existing one if a row with the primary key already exists
 	 * @param string $table
 	 * @param object|array $row.  If an object, it will be updated with any auto-increment id's.
 	 *      Arrays are copy-on-write, so the original array can't be updated.
 	 * @param bool $isInsert
-	 * @return bool True if a new row was inserted.
+	 * @return int|array primary key or keys of the row that was inserted or updated.
 	 * @throws SimpleDBException */
-	static function save(string $table, $row, $isInsert=null) : bool {
+	static function save(string $table, $row, $isInsert=null) {
 		if ($isInsert === null)
 			$isInsert = !static::findRowByPrimaries($table, $row);
 
 		if ($isInsert)
-			static::insert($table, $row);
-		else
+			return static::insert($table, $row);
+		else {
 			static::update($table, $row);
-		return $isInsert;
+
+			// Get primary keys
+			$result = [];
+			$primaries = static::getPrimaryKeys($table);
+			foreach ($primaries as $colName) {
+				$val = is_array($row) ? $row[$colName] ?? null : $row->{$colName} ?? null;
+				$result[$colName] = $val;
+			}
+
+			if (count($result) === 1)
+				return $result[$primaries[0]];
+			return $result;
+		}
 	}
 
 	/**
@@ -713,6 +820,7 @@ class SimpleDB {
 	 * @return bool */
 	static function tableExists(string $table): bool {
 		if (static::getDriver() === 'sqlite')
+			/** @noinspection SqlResolve */
 			$sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
 		else
 			$sql = "SHOW TABLES LIKE ?";
@@ -729,7 +837,7 @@ class SimpleDB {
 	 * @throws SimpleDBException|Throwable */
 	static function transaction(callable $func, ?callable $error=null) {
 		$startTime = microtime(true);
-		$timeout = static::getConfig()['lockTimeout'] ?? static::DefaultLockTimeout;
+		$lockTimeout = static::getConfig()['lockTimeout'] ?? static::DefaultLockTimeout;
 		static::connect();
 
 		TryAgain:
@@ -763,7 +871,7 @@ class SimpleDB {
 			// $connection->setAttribute(PDO::ATTR_TIMEOUT, 2000)
 			// https://www.php.net/manual/en/pdo.setattribute.php
 			// But that doesn't work.
-			if (static::getDriver()==='sqlite' && microtime(true) - $startTime < $timeout
+			if (static::getDriver()==='sqlite' && microtime(true) - $startTime < $lockTimeout
 				&& strstr($e->getMessage(), 'General error: 5 database is locked') !== false) {
 
 				usleep(intval(static::TransactionRetryWait*1000000)); // 5 ms, an arbitrary value
@@ -817,8 +925,9 @@ class SimpleDB {
 		/** @noinspection SqlWithoutWhere */
 		$sql = "UPDATE $q$table$q SET " . join(', ', $set);
 		$where = static::buildWhere($whereParams);
-		if (strlen($where))
-			$sql .= ' WHERE ' .$where;
+		if (!strlen($where))
+			throw new SimpleDBException("UPDATE has no WHERE clause.");
+		$sql .= ' WHERE ' .$where;
 		if (static::getDriver() === 'mysql')
 			$sql .= ' LIMIT 1'; // failsafe, but UPDATE with LIMIT is not supported in SQLite
 
@@ -854,7 +963,7 @@ class SimpleDB {
 	 * Convert $value to a value that can go into $col without an error.
 	 * @throws SimpleDBException
 	 * @return bool|int|float|string|DateTime */
-	public static function coerce($value, SimpleDBColumn $col) {
+	static function coerce($value, SimpleDBColumn $col) {
 		if ((is_array($value) || is_object($value)) && !($value instanceof DateTime))
 			throw new SimpleDBException(
 				'Column '.$col->name.' cannot store '. var_export($value, true));
@@ -882,9 +991,11 @@ class SimpleDB {
 		}
 
 		// Convert numbers to dates for date fields.
-		if ($col->type == SimpleDBColType::DATE) {
+		if ($col->type == SimpleDBColType::DATE || $col->type == SimpleDBColType::DATETIME) {
 			if (is_int($value) || is_float($value)) {
 				$unixTime = number_format($value, 3, '.', '');
+
+				/** @noinspection PhpUndefinedMethodInspection */
 				return static::$dateTimeClass::createFromFormat('U.u', $unixTime);
 			}
 			if (is_string($value))
@@ -945,12 +1056,12 @@ class SimpleDB {
 						$val = ($value->format('u') !== '000000')
 							? $value->format('Y-m-d H:i:s.u')
 							: $value->format('Y-m-d H:i:s');
-						$statement->bindValue($name, $val, PDO::PARAM_STR);
+						$statement->bindValue($name, $val);
 					}
 					else { // there is no PARAM_FLOAT
 						//if (!is_scalar($value) && $value !== null) // Is this too much magic?
 						//	$value = json_encode($value, JSON_INVALID_UTF8_SUBSTITUTE);
-						$statement->bindValue($name, $value, PDO::PARAM_STR);
+						$statement->bindValue($name, $value);
 					}
 					$i++;
 				}
@@ -994,13 +1105,32 @@ class SimpleDB {
 	}
 } // End class SimpleDB
 
-class SimpleDBException extends Exception {}
+
+/**
+ * We extend PDOException so catching PDOException will catch either type. */
+class SimpleDBException extends PDOException {}
 
 /**
  * Allow formatting PHP DateTimes as a string when json encoding, not an object.
  * https://stackoverflow.com/a/42190930 */
 class SimpleDBDateTime extends DateTime implements JsonSerializable {
-	public function jsonSerialize() {
+	public bool $dateOnly = false;
+
+	function __construct($time) {
+		// Replace m-d-Y format with Y-m-d format.
+		if (preg_match('#^(\d\d)[-/\\\\](\d\d)[-/\\\\](\d\d\d\d)(.*)#', $time, $matches))
+			$time = $matches[3] . '-' . $matches[1] . '-' . $matches[2] . $matches[4];
+		parent::__construct($time);
+	}
+
+	function jsonSerialize() {
+		return $this->__toString();
+	}
+
+	function __toString() {
+		if ($this->dateOnly)
+			return $this->format('Y-m-d');
+
 		return $this->format('u') !== '000000'
 			? $this->format('Y-m-d H:i:s.u')
 			: $this->format('Y-m-d H:i:s');
@@ -1026,6 +1156,7 @@ class SimpleDBColType {
 	const INT = 'Int';
 	const FLOAT = 'Float'; // Includes decimal
 	const DATE = 'Date';
+	const DATETIME = 'DateTime';
 	const ENUM = 'Enum';
 	const TEXT = 'Text';
 }
@@ -1038,9 +1169,12 @@ class SimpleDBResultSet implements Iterator {
 	public $statement;
 	public $sql;
 
+	public $coerce = true;
+
 	protected $Type;
-	/** @type array */
-	protected $types; // Unused
+
+	/** @type SimpleDBColType[] */
+	protected $types; // The type of each column.
 
 	protected $key = 0;
 	protected $current;
@@ -1049,33 +1183,37 @@ class SimpleDBResultSet implements Iterator {
 	/**
 	 * @param PDOStatement $statement
 	 * @param string|array $Type
-	 * @param string $sql
-	 * @param ?array $description */
-	function __construct(PDOStatement $statement, string $sql, $Type=null, array $description=null) {
+	 * @param string $sql*/
+	function __construct(PDOStatement $statement, string $sql, $Type=null) {
 		$this->statement = $statement;
 		$this->sql = $sql;
 		$this->Type = $Type;
 
+		// MySQL and SQLite types:
 		// http://gcov.php.net/PHP_7_3/lcov_html/ext/pdo_mysql/mysql_statement.c.gcov.php
 		$typeMap = [
 			'BIT' => SimpleDBColType::BOOL,
 			'TINY' => SimpleDBColType::INT,
 			'SHORT' => SimpleDBColType::INT,
 			'INT24' => SimpleDBColType::INT,
+			'INTEGER' => SimpleDBColType::INT,
 			'LONG' => SimpleDBColType::INT,
 			'LONGLONG' => SimpleDBColType::INT,
 			'DOUBLE' => SimpleDBColType::FLOAT,
 			'DECIMAL' => SimpleDBColType::FLOAT,
 			'NEWDECIMAL' => SimpleDBColType::FLOAT,
 			'DATE' => SimpleDBColType::DATE,
-			'DATETIME' => SimpleDBColType::DATE,
-			'TIMESTAMP' => SimpleDBColType::DATE
+			'DATETIME' => SimpleDBColType::DATETIME,
+			'TIMESTAMP' => SimpleDBColType::DATETIME
 		];
 
 		$len = $statement->columnCount();
 		for ($i=0; $i<$len; $i++) {
 			$meta = $statement->getColumnMeta($i);
-			$this->types[$meta['name']] = $typeMap[$meta['native_type']] ?? SimpleDBColType::TEXT;
+			$this->types[$meta['name']] =
+				$typeMap[strtoupper($meta['sqlite:decl_type']??'')] ??
+				$typeMap[strtoupper($meta['native_type'])] ??
+				SimpleDBColType::TEXT;
 		}
 	}
 
@@ -1130,16 +1268,28 @@ class SimpleDBResultSet implements Iterator {
 	}
 
 	function coerceRow(&$row) {
+
 		foreach ($row as $name => &$value) {
-			if ($value !== null) {
-				if ($this->types[$name] === SimpleDBColType::BOOL)
-					$value = boolval($value);
-				if ($this->types[$name] === SimpleDBColType::INT)
-					$value = intval($value);
-				if ($this->types[$name] === SimpleDBColType::FLOAT)
-					$value = floatval($value);
-				if ($this->types[$name] === SimpleDBColType::DATE)
-					$value = new SimpleDB::$dateTimeClass($value);
+
+			// Type won't exist if selecting into a class instance and that field wasn't part of the query.
+			if ($value !== null && isset($this->types[$name])) {
+
+				switch($this->types[$name]) {
+					case SimpleDBColType::BOOL:
+						$value = boolval($value);
+						break;
+					case SimpleDBColType::INT:
+						$value = intval($value);
+						break;
+					case SimpleDBColType::FLOAT:
+						$value = floatval($value);
+						break;
+					case SimpleDBColType::DATE:
+					case SimpleDBColType::DATETIME:
+						$value = new SimpleDB::$dateTimeClass($value);
+						$value->dateOnly = $this->types[$name] === SimpleDBColType::DATE;
+						break;
+				}
 			}
 		}
 	}
@@ -1157,15 +1307,15 @@ class SimpleDBResultSet implements Iterator {
 		$this->key++;
 		$this->current = $this->statement->fetch();
 
-		// Convert values of columns to the types from $this->description
-		if ($this->current)
-			$this->coerceRow($this->current);
-
-		else {
+		if (!$this->current) {
 			if ($this->statement) // If it hasn't already been closed.
 				SimpleDB::statementReturn($this);
 			$this->statement = null;
 		}
+
+		// Convert values of columns to the types from $this->description
+		elseif ($this->coerce)
+			$this->coerceRow($this->current);
 	}
 
 	/** Implements Iterable.*/
